@@ -45,6 +45,8 @@ import com.google.common.collect.Streams;
 import io.quarkus.test.junit.QuarkusMock;
 import io.smallrye.common.annotation.Identifier;
 import jakarta.inject.Inject;
+import jakarta.ws.rs.core.HttpHeaders;
+import jakarta.ws.rs.core.Response;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.lang.reflect.Method;
@@ -70,6 +72,7 @@ import org.apache.iceberg.CatalogProperties;
 import org.apache.iceberg.CatalogUtil;
 import org.apache.iceberg.ContentFile;
 import org.apache.iceberg.ContentScanTask;
+import org.apache.iceberg.DataFiles;
 import org.apache.iceberg.DataOperations;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.FileMetadata;
@@ -98,6 +101,7 @@ import org.apache.iceberg.exceptions.BadRequestException;
 import org.apache.iceberg.exceptions.CommitFailedException;
 import org.apache.iceberg.exceptions.ForbiddenException;
 import org.apache.iceberg.exceptions.NoSuchNamespaceException;
+import org.apache.iceberg.exceptions.NoSuchTableException;
 import org.apache.iceberg.exceptions.NotFoundException;
 import org.apache.iceberg.exceptions.ServiceFailureException;
 import org.apache.iceberg.exceptions.ValidationException;
@@ -148,6 +152,7 @@ import org.apache.polaris.core.persistence.dao.entity.EntityResult;
 import org.apache.polaris.core.persistence.pagination.Page;
 import org.apache.polaris.core.persistence.pagination.PageToken;
 import org.apache.polaris.core.persistence.resolver.ResolutionManifestFactory;
+import org.apache.polaris.core.persistence.resolver.ResolvedPathKey;
 import org.apache.polaris.core.persistence.resolver.ResolverFactory;
 import org.apache.polaris.core.secrets.UserSecretsManager;
 import org.apache.polaris.core.storage.CredentialVendingContext;
@@ -178,6 +183,7 @@ import org.apache.polaris.service.events.listeners.PolarisEventListener;
 import org.apache.polaris.service.events.listeners.TestPolarisEventListener;
 import org.apache.polaris.service.exception.FakeAzureHttpResponse;
 import org.apache.polaris.service.exception.IcebergExceptionMapper;
+import org.apache.polaris.service.exception.PolarisExceptionMapper;
 import org.apache.polaris.service.storage.PolarisStorageIntegrationProviderImpl;
 import org.apache.polaris.service.task.TableCleanupTaskHandler;
 import org.apache.polaris.service.task.TaskExecutor;
@@ -1854,7 +1860,8 @@ public abstract class AbstractLocalIcebergCatalogTest extends CatalogTests<Local
     Assertions.assertThatThrownBy(() -> catalog.sendNotification(table, request2))
         .isInstanceOf(AlreadyExistsException.class)
         .hasMessageContaining(
-            "A notification with a newer timestamp has been processed for table parent.child1.table");
+            "A notification with a newer timestamp has been processed for table"
+                + " parent.child1.table");
 
     // Verify that DROP notification won't be rejected due to timestamp
     NotificationRequest request3 = new NotificationRequest();
@@ -2045,6 +2052,240 @@ public abstract class AbstractLocalIcebergCatalogTest extends CatalogTests<Local
     Assertions.assertThat(catalog.tableExists(table))
         .as("Table should be dropped on receiving notification")
         .isFalse();
+  }
+
+  @Test
+  public void testUnregisterTablePreservesFiles() throws IOException {
+    catalog.createNamespace(NS);
+    BaseTable table =
+        (BaseTable) catalog.buildTable(TABLE, SCHEMA).withPartitionSpec(SPEC).create();
+    String dataPath = table.location() + "/data.parquet";
+    try (var output = fileIO.newOutputFile(dataPath).create()) {
+      output.write(new byte[] {1, 2, 3});
+    }
+    table
+        .newAppend()
+        .appendFile(
+            DataFiles.builder(SPEC)
+                .withPath(dataPath)
+                .withPartitionPath("id_bucket=0")
+                .withFileSizeInBytes(3)
+                .withRecordCount(1)
+                .build())
+        .commit();
+    TableMetadata before = table.operations().current();
+    List<String> files = new ArrayList<>();
+    files.add(dataPath);
+    files.add(before.metadataFileLocation());
+    before.previousFiles().forEach(file -> files.add(file.file()));
+    files.add(before.currentSnapshot().manifestListLocation());
+    before.currentSnapshot().allManifests(fileIO).forEach(manifest -> files.add(manifest.path()));
+    assertThat(files).allMatch(file -> fileIO.newInputFile(file).exists());
+
+    TableMetadata unregistered = catalog.unregisterTable(TABLE);
+
+    assertThat(unregistered.metadataFileLocation()).isEqualTo(before.metadataFileLocation());
+    assertThat(unregistered.uuid()).isEqualTo(before.uuid());
+    assertThat(unregistered.currentSnapshot().snapshotId())
+        .isEqualTo(before.currentSnapshot().snapshotId());
+    assertThat(catalog.tableExists(TABLE)).isFalse();
+    assertThat(files).allMatch(file -> fileIO.newInputFile(file).exists());
+    assertThat(
+            metaStoreManager
+                .loadTasks(polarisContext, "testExecutor", PageToken.readEverything())
+                .getEntities())
+        .isEmpty();
+    assertThatThrownBy(() -> catalog.unregisterTable(TABLE))
+        .isInstanceOf(NoSuchTableException.class);
+    assertThatThrownBy(() -> table.updateProperties().set("after-unregister", "true").commit())
+        .isInstanceOf(NoSuchTableException.class);
+
+    Table registered = catalog.registerTable(TABLE, unregistered.metadataFileLocation());
+    assertThat(registered.currentSnapshot().snapshotId())
+        .isEqualTo(before.currentSnapshot().snapshotId());
+  }
+
+  @Test
+  public void testUnregisterTableRejectsConcurrentCommit() {
+    catalog.createNamespace(NS);
+    Table table = catalog.buildTable(TABLE, SCHEMA).create();
+    PolarisMetaStoreManager concurrentManager = spy(metaStoreManager);
+    doAnswer(
+            invocation -> {
+              table.updateProperties().set("concurrent-commit", "kept").commit();
+              return invocation.callRealMethod();
+            })
+        .when(concurrentManager)
+        .dropEntityIfNotChanged(any(), anyList(), any());
+    catalog.setMetaStoreManager(concurrentManager);
+
+    assertThatThrownBy(() -> catalog.unregisterTable(TABLE))
+        .isInstanceOfSatisfying(
+            PolarisServiceUnavailableException.class,
+            failure -> {
+              try (Response response = new PolarisExceptionMapper().toResponse(failure)) {
+                assertThat(response.getStatus()).isEqualTo(503);
+                assertThat(response.getHeaderString(HttpHeaders.RETRY_AFTER)).isEqualTo("3");
+              }
+            })
+        .hasMessageContaining("retry unregister");
+    assertThat(catalog.tableExists(TABLE)).isTrue();
+    assertThat(catalog.loadTable(TABLE).properties()).containsEntry("concurrent-commit", "kept");
+
+    catalog.setMetaStoreManager(metaStoreManager);
+    TableMetadata unregistered = catalog.unregisterTable(TABLE);
+    assertThat(unregistered.properties()).containsEntry("concurrent-commit", "kept");
+    assertThat(catalog.tableExists(TABLE)).isFalse();
+  }
+
+  @ParameterizedTest
+  @ValueSource(ints = {0, 1, 2})
+  public void testUnregisterTableUsesResolvedVersion(int concurrentCommits) throws IOException {
+    catalog.createNamespace(NS);
+    BaseTable table =
+        (BaseTable)
+            catalog
+                .buildTable(TABLE, SCHEMA)
+                .withProperties(
+                    Map.of(
+                        TableProperties.METADATA_DELETE_AFTER_COMMIT_ENABLED, "true",
+                        TableProperties.METADATA_PREVIOUS_VERSIONS_MAX, "1"))
+                .create();
+    TableMetadata metadata = table.operations().current();
+    PolarisPassthroughResolutionView view =
+        spy(
+            new PolarisPassthroughResolutionView(
+                resolutionManifestFactory, authenticatedRoot, CATALOG_NAME));
+    ResolvedPathKey key = ResolvedPathKey.ofTableLike(TABLE);
+    doReturn(view.getResolvedPath(key, PolarisEntitySubType.ICEBERG_TABLE))
+        .when(view)
+        .getResolvedPath(key, PolarisEntitySubType.ICEBERG_TABLE);
+    for (int commit = 1; commit <= concurrentCommits; commit++) {
+      table.updateProperties().set("new-version", Integer.toString(commit)).commit();
+    }
+    TableMetadata current = table.operations().current();
+    assertThat(metadataFileExists(metadata.metadataFileLocation()))
+        .isEqualTo(concurrentCommits < 2);
+
+    try (LocalIcebergCatalog requestCatalog =
+        new LocalIcebergCatalog(
+            diagServices,
+            resolverFactory,
+            metaStoreManager,
+            polarisContext,
+            view,
+            authenticatedRoot,
+            mock(TaskExecutor.class),
+            storageAccessConfigProvider,
+            fileIOFactory,
+            polarisEventDispatcher,
+            eventMetadataFactory)) {
+      requestCatalog.setCatalogFileIo(fileIO);
+      requestCatalog.initialize(
+          CATALOG_NAME,
+          Map.of(CatalogProperties.FILE_IO_IMPL, "org.apache.iceberg.inmemory.InMemoryFileIO"));
+      if (concurrentCommits > 0) {
+        assertThatThrownBy(() -> requestCatalog.unregisterTable(TABLE))
+            .isInstanceOfSatisfying(
+                PolarisServiceUnavailableException.class,
+                failure -> {
+                  try (Response response = new PolarisExceptionMapper().toResponse(failure)) {
+                    assertThat(response.getStatus()).isEqualTo(503);
+                    assertThat(response.getHeaderString(HttpHeaders.RETRY_AFTER)).isEqualTo("3");
+                  }
+                });
+        assertThat(catalog.loadTable(TABLE).properties())
+            .containsEntry("new-version", Integer.toString(concurrentCommits));
+      } else {
+        assertThat(requestCatalog.unregisterTable(TABLE).metadataFileLocation())
+            .isEqualTo(metadata.metadataFileLocation());
+      }
+    }
+    assertThat(catalog.tableExists(TABLE)).isEqualTo(concurrentCommits > 0);
+    if (concurrentCommits > 0) {
+      TableMetadata unregistered = catalog.unregisterTable(TABLE);
+      assertThat(unregistered.metadataFileLocation()).isEqualTo(current.metadataFileLocation());
+      assertThat(unregistered.properties())
+          .containsEntry("new-version", Integer.toString(concurrentCommits));
+      assertThat(catalog.tableExists(TABLE)).isFalse();
+    }
+    assertThat(fileIO.newInputFile(current.metadataFileLocation()).exists()).isTrue();
+    assertThat(
+            metaStoreManager
+                .loadTasks(polarisContext, "testExecutor", PageToken.readEverything())
+                .getEntities())
+        .isEmpty();
+  }
+
+  @Test
+  public void testUnregisterTablePreservesMissingMetadataFailure() {
+    catalog.createNamespace(NS);
+    BaseTable table = (BaseTable) catalog.buildTable(TABLE, SCHEMA).create();
+    String metadataLocation = table.operations().current().metadataFileLocation();
+    fileIO.deleteFile(metadataLocation);
+
+    assertThatThrownBy(() -> catalog.unregisterTable(TABLE)).isInstanceOf(NotFoundException.class);
+    assertThat(catalog.listTables(NS)).contains(TABLE);
+    assertThat(
+            metaStoreManager
+                .loadTasks(polarisContext, "testExecutor", PageToken.readEverything())
+                .getEntities())
+        .isEmpty();
+  }
+
+  @Test
+  public void testUnregisterTableRejectsInFlightCommit() {
+    catalog.createNamespace(NS);
+    BaseTable table = (BaseTable) catalog.buildTable(TABLE, SCHEMA).create();
+    TableOperations operations = table.operations();
+    TableMetadata before = operations.current();
+    TableMetadata updated =
+        TableMetadata.buildFrom(before).setProperties(Map.of("late-commit", "rejected")).build();
+    IcebergTableLikeEntity entity = readTableEntity(TABLE);
+    List<PolarisEntityCore> parentPath = catalogPath(NS);
+    List<EntityResult> updateResults = new ArrayList<>();
+    PolarisMetaStoreManager concurrentManager = spy(metaStoreManager);
+    doAnswer(
+            invocation -> {
+              TableMetadata unregistered = catalog.unregisterTable(TABLE);
+              assertThat(unregistered.metadataFileLocation())
+                  .isEqualTo(before.metadataFileLocation());
+              EntityResult result = (EntityResult) invocation.callRealMethod();
+              updateResults.add(result);
+              return result;
+            })
+        .when(concurrentManager)
+        .updateEntityPropertiesIfNotChanged(any(), anyList(), any());
+    catalog.setMetaStoreManager(concurrentManager);
+
+    assertThatThrownBy(() -> operations.commit(before, updated))
+        .isInstanceOf(RuntimeException.class);
+
+    assertThat(updateResults)
+        .singleElement()
+        .satisfies(result ->
+            assertThat(result.getReturnStatus())
+                .isIn(
+                    BaseResult.ReturnStatus.TARGET_ENTITY_CONCURRENTLY_MODIFIED,
+                    BaseResult.ReturnStatus.ENTITY_NOT_FOUND,
+                    BaseResult.ReturnStatus.CATALOG_PATH_CANNOT_BE_RESOLVED));
+    assertThat(
+            metaStoreManager
+                .loadEntity(polarisContext, entity.getCatalogId(), entity.getId(), entity.getType())
+                .getReturnStatus())
+        .isEqualTo(BaseResult.ReturnStatus.ENTITY_NOT_FOUND);
+    assertThat(
+            metaStoreManager
+                .readEntityByName(
+                    polarisContext,
+                    parentPath,
+                    PolarisEntityType.TABLE_LIKE,
+                    PolarisEntitySubType.ICEBERG_TABLE,
+                    TABLE.name())
+                .getReturnStatus())
+        .isEqualTo(BaseResult.ReturnStatus.ENTITY_NOT_FOUND);
+    assertThat(catalog.listTables(NS)).doesNotContain(TABLE);
+    assertThat(fileIO.newInputFile(before.metadataFileLocation()).exists()).isTrue();
   }
 
   @Test
@@ -2383,6 +2624,38 @@ public abstract class AbstractLocalIcebergCatalogTest extends CatalogTests<Local
         .isInstanceOf(ServiceFailureException.class)
         .hasMessageContaining("Failed to drop table")
         .hasMessageContaining("UNEXPECTED_ERROR_SIGNALED");
+  }
+
+  @ParameterizedTest
+  @ValueSource(booleans = {false, true})
+  public void testDropTableWithConcurrentChange(boolean purge) {
+    catalog.createNamespace(NS);
+    BaseTable table = (BaseTable) catalog.buildTable(TABLE, SCHEMA).create();
+    String metadataLocation = table.operations().current().metadataFileLocation();
+    PolarisMetaStoreManager spiedManager = spy(metaStoreManager);
+    doReturn(
+            new DropEntityResult(BaseResult.ReturnStatus.TARGET_ENTITY_CONCURRENTLY_MODIFIED, null))
+        .when(spiedManager)
+        .dropEntityIfExists(any(), anyList(), any(), anyMap(), anyBoolean());
+    catalog.setMetaStoreManager(spiedManager);
+
+    assertThatThrownBy(() -> catalog.dropTable(TABLE, purge))
+        .isInstanceOfSatisfying(
+            PolarisServiceUnavailableException.class,
+            failure -> {
+              try (Response response = new PolarisExceptionMapper().toResponse(failure)) {
+                assertThat(response.getStatus()).isEqualTo(503);
+                assertThat(response.getHeaderString(HttpHeaders.RETRY_AFTER)).isEqualTo("3");
+              }
+            })
+        .hasMessageContaining("retry drop");
+    assertThat(catalog.tableExists(TABLE)).isTrue();
+    assertThat(fileIO.newInputFile(metadataLocation).exists()).isTrue();
+    assertThat(
+            metaStoreManager
+                .loadTasks(polarisContext, "testExecutor", PageToken.readEverything())
+                .getEntities())
+        .isEmpty();
   }
 
   @Test
